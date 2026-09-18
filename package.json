@@ -1,0 +1,19 @@
+{
+  "name": "excal_coder",
+  "version": "1.0.0",
+  "description": "Excal Coder - Sovereign Indian Coding IDE",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [],
+  "author": "Indrooneel",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^5.2.1",
+    "openai": "^7.17.0",
+    "ws": "^8.21.3"
+  }
+}
