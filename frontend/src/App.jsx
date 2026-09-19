@@ -4,7 +4,8 @@ import ChatPanel from "./components/ChatPanel";
 import StatusBar from "./components/StatusBar";
 
 export default function App() {
-  const { connected, messages, thinking, pendingPlan, activeFile, send, approve } = useExcalSocket()
+  // ✅ added `deny` to the destructure
+  const { connected, messages, thinking, pendingPlan, activeFile, send, approve, deny } = useExcalSocket()
 
   return (
     <div className="flex h-screen flex-col bg-[#1e1e1e] text-white">
@@ -13,7 +14,15 @@ export default function App() {
           <EditorPane file={activeFile} />
         </div>
         <div className="w-[380px] shrink-0">
-          <ChatPanel messages={messages} thinking={thinking} pendingPlan={pendingPlan} onSend={send} onApprove={approve} />
+          {/* ✅ added onDeny={deny} */}
+          <ChatPanel
+            messages={messages}
+            thinking={thinking}
+            pendingPlan={pendingPlan}
+            onSend={send}
+            onApprove={approve}
+            onDeny={deny}
+          />
         </div>
       </div>
       <StatusBar connected={connected} />

@@ -1,1 +1,1 @@
-print('Excal Coder v0.2 is alive')
+print('hi from excal')

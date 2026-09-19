@@ -9,7 +9,7 @@ const STYLES = {
   error: 'self-center text-[11px] text-red-300 bg-[#331c1c] border border-red-900 rounded px-2 py-1 max-w-[90%]',
 }
 
-export default function ChatPanel({ messages, thinking, pendingPlan, onSend, onApprove }) {
+export default function ChatPanel({ messages, thinking, pendingPlan, onSend, onApprove, onDeny }) { // ✅ added onDeny
   const [input, setInput] = useState('')
   const endRef = useRef(null)
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, thinking, pendingPlan])
@@ -21,7 +21,7 @@ export default function ChatPanel({ messages, thinking, pendingPlan, onSend, onA
       <div className="border-b border-[#444] bg-[#333] px-4 py-3 font-bold">⚡ Excal Coder</div>
       <div className="flex flex-1 flex-col gap-2 overflow-y-auto p-4 text-sm">
         {messages.map((m, i) => <div key={i} className={STYLES[m.kind]}>{m.text}</div>)}
-        {pendingPlan && <MigGate plan={pendingPlan} onApprove={onApprove} />}
+        {pendingPlan && <MigGate plan={pendingPlan} onApprove={onApprove} onDeny={onDeny} />} {/* ✅ passed through */}
         {thinking && <div className="self-center animate-pulse text-xs italic text-sky-300">🧠 Excal is thinking…</div>}
         <div ref={endRef} />
       </div>

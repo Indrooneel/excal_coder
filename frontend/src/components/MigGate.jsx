@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-export default function MigGate({ plan, onApprove }) {
+export default function MigGate({ plan, onApprove, onDeny }) { // 1. Added onDeny prop
   const [constraints, setConstraints] = useState('')
   const isCmd = plan.tool === 'run_command'
   const preview = isCmd ? `$ ${plan.args.command ?? ''}` : (plan.args.content ?? '')
@@ -18,12 +18,24 @@ export default function MigGate({ plan, onApprove }) {
         value={constraints}
         onChange={(e) => setConstraints(e.target.value)}
       />
-      <button
-        className="w-full rounded bg-[#0e639c] py-2 text-sm font-bold text-white transition hover:bg-[#1177bb]"
-        onClick={() => onApprove(constraints)}
-      >
-        Apply & Execute
-      </button>
+      
+      {/* 2. Wrapped buttons in a flex container */}
+      <div className="flex gap-2">
+        <button
+          className="flex-1 rounded bg-[#0e639c] py-2 text-sm font-bold text-white transition hover:bg-[#1177bb]"
+          onClick={() => onApprove(constraints)}
+        >
+          Apply & Execute
+        </button>
+        
+        {/* 3. Added the Deny button */}
+        <button
+          className="flex-1 rounded bg-[#a12626] py-2 text-sm font-bold text-white transition hover:bg-[#c42c2c]"
+          onClick={() => onDeny()}
+        >
+          Deny
+        </button>
+      </div>
     </div>
   )
 }

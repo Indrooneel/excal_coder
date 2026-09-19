@@ -25,8 +25,18 @@ export default function useExcalSocket() {
       else if (msg.type === 'tool_call')
         push({ kind: 'tool', text: `🛠️ ${msg.tool} ${JSON.stringify(msg.args).slice(0, 80)}${msg.constraints ? ` (constrained: ${msg.constraints})` : ''}` })
       else if (msg.type === 'tool_result') {
-        push({ kind: msg.ok === false ? 'error' : 'tool', text: msg.ok === false ? String(msg.result) : '✅ ' + String(msg.result) }.text ? { kind: msg.ok === false ? 'error' : 'tool', text: msg.ok === false ? String(msg.result).slice(0, 200) : '✅ ' + String(msg.result).slice(0, 200) } : null)
-        if (msg.file && msg.content !== undefined) setActiveFile({ path: msg.file, content: msg.content })
+        const isError = msg.ok === false;
+        const rawText = String(msg.result || '');
+        const truncated = rawText.length > 200 ? rawText.slice(0, 200) + '...' : rawText;
+        
+        push({ 
+          kind: isError ? 'error' : 'tool', 
+          text: isError ? truncated : '✅ ' + truncated 
+        });
+        
+        if (msg.file && msg.content !== undefined) {
+          setActiveFile({ path: msg.file, content: msg.content });
+        }
       }
       else if (msg.type === 'mig_verdict') push({ kind: 'verdict', text: `🛡️ MIG VERDICT: ${msg.verdict}` })
       else if (msg.type === 'final') push({ kind: 'ai', text: msg.content })
@@ -48,5 +58,12 @@ export default function useExcalSocket() {
     setThinking(true)
   }, [])
 
-  return { connected, messages, thinking, pendingPlan, activeFile, send, approve }
+  // NEW: The deny function
+  const deny = useCallback(() => {
+    wsRef.current?.send(JSON.stringify({ type: 'deny' }))
+    setPendingPlan(null)
+    setThinking(true)
+  }, [])
+
+  return { connected, messages, thinking, pendingPlan, activeFile, send, approve, deny }
 }
