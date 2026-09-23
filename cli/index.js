@@ -4,6 +4,7 @@ import readline from 'readline/promises';
 import { stdin, stdout } from 'process';
 import { suggestConstraints } from './lib/mig.js';
 import { runAgentLoop, SYSTEM_PROMPT } from './lib/agent.js';
+import { executeTool } from './lib/tools.js';
 
 // ─── Color palette ──────────────────────────────────────────
 const C = {
@@ -47,6 +48,33 @@ function truncate(s, n = 3) {
 
 // ─── Session state ──────────────────────────────────────────
 const rl = readline.createInterface({ input: stdin, output: stdout });
+
+let activeController = null;
+let closed = false;
+rl.on('close', () => { closed = true; activeController?.abort(); });
+rl.on('SIGINT', () => {
+  if (activeController) {
+    activeController.abort();
+    console.log('\nCancelling current task…');
+  } else rl.close();
+});
+async function ask(prompt, { signal } = {}) {
+  if (closed) return null;
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  rl.once('close', abort);
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) controller.abort();
+  try { return await rl.question(prompt, { signal: controller.signal }); }
+  catch (err) {
+    if (closed || err.code === 'ERR_USE_AFTER_CLOSE') return null;
+    throw err;
+  } finally {
+    rl.removeListener('close', abort);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
 const cwd = process.cwd();
 
 const session = {
@@ -59,6 +87,8 @@ const session = {
 
 // ─── UI object passed to agent loop ────────────────────────
 const ui = {
+  notice: (text) => console.log(`\n${C.yellow}${text}${C.reset}`),
+
   thinking: () => {
     process.stdout.write(`${C.dim}${C.italic}🧠 thinking…${C.reset}\r`);
   },
@@ -85,6 +115,7 @@ const ui = {
   },
 
   verdict: (v, plan) => {
+    if (v.decision === 'ALLOW') return;
     blank();
     const isAllow = v.decision === 'ALLOW';
     const isDeny  = v.decision === 'DENY';
@@ -106,20 +137,22 @@ const ui = {
     blank();
   },
 
-  approve: async (plan, verdict) => {
+  approve: async (plan, verdict, { signal, before } = {}) => {
     // Show a clean gate box for the plan
     let body = '';
     if (plan.tool === 'run_command') {
       body = `${C.bold}$ ${plan.args.command}${C.reset}`;
     } else if (plan.tool === 'write_file') {
-      body = `${C.bold}${plan.args.path}${C.reset}\n${C.gray}${truncate(plan.args.content, 5)}${C.reset}`;
+      body = `${C.bold}${plan.args.path}${C.reset}\n`;
+      if (before !== null && before !== undefined) body += `${C.red}--- current content\n${before}${C.reset}\n`;
+      body += `${C.green}+++ proposed content\n${plan.args.content}${C.reset}`;
     } else if (plan.tool === 'edit_file') {
       const oldLines = (plan.args.old_string || '').split('\n');
       const newLines = (plan.args.new_string || '').split('\n');
       body = `${C.bold}${plan.args.path}${C.reset}\n`;
-      body += oldLines.slice(0, 4).map(l => `${C.red}- ${l}${C.reset}`).join('\n');
+      body += oldLines.map(l => `${C.red}- ${l}${C.reset}`).join('\n');
       body += '\n';
-      body += newLines.slice(0, 4).map(l => `${C.green}+ ${l}${C.reset}`).join('\n');
+      body += newLines.map(l => `${C.green}+ ${l}${C.reset}`).join('\n');
     } else {
       body = JSON.stringify(plan.args, null, 2);
     }
@@ -127,8 +160,9 @@ const ui = {
     box(`⚠  APPROVAL REQUIRED — ${plan.tool}`, body, C.yellow);
     blank();
 
-    const ans = await rl.question(`${C.bold}  approve? ${C.gray}[y/N]${C.reset} `);
-    return /^y(es)?$/i.test(ans.trim());
+    if (plan.tool === 'run_command') console.log(`${C.dim}  Shell access uses your account permissions; it is not sandboxed.${C.reset}`);
+    const ans = await ask(`${C.bold}  approve? ${C.gray}[y/N]${C.reset} `, { signal });
+    return ans !== null && /^y(es)?$/i.test(ans.trim());
   },
 };
 
@@ -143,7 +177,7 @@ console.log(`  ${C.bold}cwd${C.reset}     ${C.gray}${cwd}${C.reset}`);
 console.log(`  ${C.bold}model${C.reset}   ${C.gray}${process.env.EXCAL_MODEL || 'openai/gpt-oss-120b'}${C.reset}`);
 console.log(`  ${C.bold}mig${C.reset}     ${C.green}active${C.reset} ${C.gray}(local deterministic stub)${C.reset}`);
 line();
-console.log(`  ${C.gray}type ${C.bold}exit${C.reset}${C.gray} to quit  ·  ${C.bold}ctrl+c${C.reset}${C.gray} to abort${C.reset}`);
+console.log(`  ${C.gray}type ${C.bold}exit${C.reset}${C.gray} to quit  ·  ${C.bold}ctrl+c${C.reset}${C.gray} to cancel a task  ·  /help for commands${C.reset}`);
 blank();
 
 // ─── Main loop ──────────────────────────────────────────────
@@ -154,15 +188,47 @@ while (true) {
     : '';
   if (chip) console.log(`${C.gray}  constraint active: ${chip}${C.reset}`);
 
-  const prompt = await rl.question(`${C.bold}${C.green}  ▸ ${C.reset}`);
+  const prompt = await ask(`${C.bold}${C.green}  ▸ ${C.reset}`);
+  if (prompt === null) break;
   if (!prompt.trim()) continue;
   if (/^(exit|quit|:q)$/i.test(prompt.trim())) break;
   if (prompt.trim() === 'clear') { console.clear(); continue; }
 
+  const input = prompt.trim();
+  if (input === '/help') {
+    console.log('\n/help — commands\n/constraints [text] — view or replace constraints; use - to clear\n/diff — inspect workspace changes\n/clear — reset conversation (keeps constraints)\n/continue — resume the current task\nexit — quit\nCtrl+C — cancel an active task\n');
+    continue;
+  }
+  if (input === '/constraints' || input.startsWith('/constraints ')) {
+    const value = input.slice('/constraints'.length).trim();
+    if (value) session.constraints = value === '-' ? '' : value;
+    console.log(`Constraints: ${session.constraints || '(none)'}`);
+    continue;
+  }
+  if (input === '/diff') {
+    const result = await executeTool({ tool: 'git_diff', args: {} }, cwd);
+    console.log(result.result);
+    continue;
+  }
+  if (input === '/clear') {
+    session.messages = [{ role: 'system', content: SYSTEM_PROMPT }];
+    session.objective = '';
+    session.rejectedActions = new Set();
+    console.log('Conversation cleared.');
+    continue;
+  }
+  if (input.startsWith('/') && input !== '/continue') {
+    console.log('Unknown command. Type /help.');
+    continue;
+  }
+  if (input === '/continue' && !session.objective) {
+    console.log('No active task to continue.');
+    continue;
+  }
   session.turnCount++;
 
   // Phase 1 — pre-flight constraint collection
-  const suggestions = await suggestConstraints(prompt);
+  const suggestions = input === '/continue' ? [] : await suggestConstraints(prompt);
   let constraints = session.constraints;
 
   if (suggestions.length) {
@@ -171,7 +237,8 @@ while (true) {
     suggestions.forEach((s, i) => {
       console.log(`${C.gray}    ${C.dim}${i + 1}.${C.reset}${C.gray} ${s}${C.reset}`);
     });
-    const ans = await rl.question(`${C.gray}  add constraints? (blank = keep current, "-" = clear) > ${C.reset}`);
+    const ans = await ask(`${C.gray}  add constraints? (blank = keep current, "-" = clear) > ${C.reset}`);
+    if (ans === null) break;
     if (ans.trim() === '-') constraints = '';
     else if (ans.trim()) constraints = ans.trim();
   }
@@ -179,14 +246,21 @@ while (true) {
   session.constraints = constraints;
   blank();
 
-  session.messages.push({ role: 'user', content: prompt });
+  if (input !== '/continue') {
+    session.objective = prompt;
+    session.rejectedActions = new Set();
+  }
+  session.messages.push({ role: 'user', content: input === '/continue' ? 'Continue the active task from its current state. Recheck files if needed.' : prompt });
 
   try {
-    await runAgentLoop(session, ui, cwd);
+    activeController = new AbortController();
+    await runAgentLoop(session, ui, cwd, { signal: activeController.signal });
   } catch (err) {
     blank();
     box('❌ error', err.message.slice(0, 300), C.red);
     blank();
+  } finally {
+    activeController = null;
   }
 }
 

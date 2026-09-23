@@ -1,3 +1,5 @@
+import { validatePlan } from './contracts.js';
+
 // MIG v0.4 stub
 // cli/lib/mig.js
 // MIG interface — local deterministic stub.
@@ -83,6 +85,7 @@ export async function suggestConstraints(prompt) {
 }
 
 export async function validate(tool, args, constraints = '') {
+  try { validatePlan({ tool, args }); } catch (err) { return { decision: 'DENY', risk: 90, reason: err.message }; }
   const c = (constraints || '').toLowerCase();
   const words = c.split(/[^a-z0-9_.+#-]+/).filter((w) => w.length > 2 && !STOP.has(w));
 
@@ -104,6 +107,9 @@ export async function validate(tool, args, constraints = '') {
   // ── write_file / edit_file: path + language + content ───────
   if (tool === 'write_file' || tool === 'edit_file') {
     const target = (args.path || '').toLowerCase();
+    if (tool === 'write_file' && !args.content.trim() && /(?:^|[\\/])(?:build|dist|target|node_modules)(?:[\\/]|$)/i.test(target)) {
+      return { decision: 'DENY', risk: 80, reason: 'Empty writes inside generated or dependency directories are blocked' };
+    }
     const content = ((args.content || '') + ' ' + (args.new_string || '')).toLowerCase();
 
     for (const w of words) {

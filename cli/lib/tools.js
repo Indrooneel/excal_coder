@@ -1,46 +1,91 @@
 // cli/lib/tools.js
 import fs from 'fs';
 import path from 'path';
-import { exec, execFile } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 import fg from 'fast-glob';
 import { buildRepoMap } from './repo-map.js';
+import { validatePlan, resolveWorkspacePath } from './contracts.js';
+import { randomUUID } from 'node:crypto';
 
-const execP = promisify(exec);
 const execFileP = promisify(execFile);
 
 const IGNORED_DIRS = new Set([
   'node_modules', '.git', '__pycache__', 'myenv', 'venv', '.venv',
-  'dist', 'build', '.next', '.cache', 'coverage', '.pytest_cache',
 ]);
 
-export function runCommand(cmd, cwd) {
-  return new Promise((resolve) => {
-    exec(cmd, { cwd, timeout: 30000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
-      let out = (stdout || '') + (stderr ? '\n[stderr]\n' + stderr : '');
-      if (out.length > 6000) out = out.slice(0, 6000) + '\n...[truncated]';
-      if (err?.code === 'ETIMEDOUT') out += '\n[timed out after 30s]';
-      resolve({ ok: !err, result: out || '(no output)' });
-    });
+export function runCommand(cmd, cwd, { signal, timeoutMs = 30000 } = {}) {
+  return new Promise(resolve => {
+    if (signal?.aborted) return resolve({ ok: false, result: '[cancelled]' });
+    const child = spawn(cmd, { cwd, shell: true, detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '', bytes = 0, timedOut = false, overflow = false, settled = false;
+    const kill = () => {
+      try {
+        if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL');
+        else if (child.pid) execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
+      } catch { child.kill('SIGKILL'); }
+    };
+    const cancel = () => kill();
+    const timer = setTimeout(() => { timedOut = true; kill(); }, timeoutMs);
+    signal?.addEventListener('abort', cancel, { once: true });
+    const receive = stream => chunk => {
+      bytes += Buffer.byteLength(chunk);
+      if (stream === 'stdout') stdout = (stdout + chunk).slice(0, 6000);
+      else stderr = (stderr + chunk).slice(0, 6000);
+      if (bytes > 1024 * 1024) { overflow = true; kill(); }
+    };
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', receive('stdout'));
+    child.stderr.on('data', receive('stderr'));
+    const finish = (code, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', cancel);
+      let out = stdout + (stderr ? '\n[stderr]\n' + stderr : '');
+      if (out.length > 6000 || bytes > 6000) out = out.slice(0, 6000) + '\n...[truncated]';
+      if (signal?.aborted) out += '\n[cancelled]';
+      else if (timedOut) out += `\n[timed out after ${timeoutMs / 1000}s]`;
+      else if (overflow) out += '\n[output exceeded 1 MB limit]';
+      else if (code !== 0) out += `\n[command failed: ${error || code}]`;
+      resolve({ ok: code === 0 && !signal?.aborted && !timedOut && !overflow, result: out || '(no output)' });
+    };
+    child.on('error', err => finish(null, err.message));
+    child.on('close', (code, killedBy) => finish(code, killedBy));
+    if (signal?.aborted) cancel();
   });
+}
+
+function atomicWrite(filePath, content) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temp = path.join(path.dirname(filePath), `.excal-${randomUUID()}.tmp`);
+  try {
+    const mode = fs.existsSync(filePath) ? fs.statSync(filePath).mode & 0o777 : 0o600;
+    fs.writeFileSync(temp, content, { encoding: 'utf8', flag: 'wx', mode });
+    fs.renameSync(temp, filePath);
+  } finally {
+    if (fs.existsSync(temp)) fs.unlinkSync(temp);
+  }
 }
 
 async function searchCode(args, cwd) {
   const pattern = args.pattern;
   if (!pattern) return { ok: false, result: 'search_code: missing pattern' };
-  const dir = path.resolve(cwd, args.directory || '.');
+  const dir = resolveWorkspacePath(cwd, args.directory || '.');
   const glob = args.glob || undefined;
 
   try {
     const rgArgs = ['--line-number', '--no-heading', '--color', 'never', '--max-count', '50'];
     if (glob) rgArgs.push('-g', glob);
-    rgArgs.push(pattern, dir);
-    const { stdout } = await execFileP('rg', rgArgs, { maxBuffer: 1024 * 1024 });
+    rgArgs.push('--', pattern, dir);
+    const { stdout } = await execFileP('rg', rgArgs, { cwd, timeout: 10000, maxBuffer: 1024 * 1024 });
     return { ok: true, result: stdout.slice(0, 4000) || '(no matches)' };
   } catch (e) {
     if (e.code === 1) return { ok: true, result: '(no matches)' };
     if (e.code === 'ENOENT' || /not recognized|not found/i.test(e.message)) {
-      return { ok: false, result: 'ripgrep (rg) not installed. Run: winget install BurntSushi.ripgrep.MSVC' };
+      return { ok: false, result: 'ripgrep (rg) is not installed. Install it with your operating system package manager.' };
     }
     return { ok: false, result: `search failed: ${e.message}` };
   }
@@ -48,7 +93,8 @@ async function searchCode(args, cwd) {
 
 async function findFiles(args, cwd) {
   const pattern = args.pattern || '**/*';
-  const dir = path.resolve(cwd, args.directory || '.');
+  if (path.isAbsolute(pattern) || pattern.split(/[\\/]/).includes('..')) return { ok: false, result: 'Glob must stay inside the workspace' };
+  const dir = resolveWorkspacePath(cwd, args.directory || '.');
   try {
     const files = await fg(pattern, {
       cwd: dir,
@@ -61,7 +107,7 @@ async function findFiles(args, cwd) {
       deep: 8,
       followSymbolicLinks: false,
     });
-    return { ok: true, result: files.slice(0, 300).join('\n') || '(no matches)' };
+    return { ok: true, result: files.filter(file => { try { resolveWorkspacePath(dir, file); return true; } catch { return false; } }).slice(0, 300).join('\n') || '(no matches)' };
   } catch (e) {
     return { ok: false, result: `find_files failed: ${e.message}` };
   }
@@ -70,7 +116,7 @@ async function findFiles(args, cwd) {
 function getProjectInfo(cwd) {
   const info = {};
 
-  const pkgPath = path.join(cwd, 'package.json');
+  const pkgPath = resolveWorkspacePath(cwd, 'package.json');
   if (fs.existsSync(pkgPath)) {
     try {
       const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
@@ -130,14 +176,35 @@ async function gitDiff(cwd) {
   }
 }
 
-export async function executeTool(plan, cwd) {
+export function prepareToolExecution(plan, cwd) {
+  validatePlan(plan);
   const { tool, args } = plan;
+  const write = ['write_file', 'edit_file'].includes(tool);
+  if (args.path || args.directory) resolveWorkspacePath(cwd, args.path || args.directory, { write });
+  if (!write) return {};
+  const filePath = resolveWorkspacePath(cwd, args.path, { write: true });
+  const exists = fs.existsSync(filePath);
+  if (tool === 'edit_file' && !exists) throw new Error(`File not found: ${args.path}`);
+  if (exists && fs.statSync(filePath).size > 1_000_000) throw new Error('Existing file exceeds 1 MB edit limit');
+  const before = exists ? fs.readFileSync(filePath, 'utf8') : null;
+  return { before };
+}
+
+export async function executeTool(plan, cwd, options = {}) {
   try {
+    validatePlan(plan);
+    if (options.signal?.aborted) return { ok: false, result: '[cancelled]' };
+    const { tool, args } = plan;
+    if (['write_file', 'edit_file'].includes(tool)) {
+      const current = prepareToolExecution(plan, cwd);
+      if (Object.hasOwn(options, 'before') && current.before !== options.before) {
+        return { ok: false, result: 'File changed since approval was requested. Read it and propose the edit again.' };
+      }
+    }
     // ── write_file ─────────────────────────────────────────────
     if (tool === 'write_file') {
-      const filePath = path.resolve(cwd, args.path);
-      fs.mkdirSync(path.dirname(filePath), { recursive: true });
-      fs.writeFileSync(filePath, args.content, 'utf-8');
+      const filePath = resolveWorkspacePath(cwd, args.path, { write: tool !== 'read_file' });
+      atomicWrite(filePath, args.content);
       return {
         ok: true,
         result: `Wrote ${args.path} (${args.content.length} chars)`,
@@ -148,7 +215,7 @@ export async function executeTool(plan, cwd) {
 
     // ── edit_file (patch one unique block) ─────────────────────
     if (tool === 'edit_file') {
-      const filePath = path.resolve(cwd, args.path);
+      const filePath = resolveWorkspacePath(cwd, args.path, { write: tool !== 'read_file' });
       if (!fs.existsSync(filePath)) return { ok: false, result: `File not found: ${args.path}` };
 
       const original = fs.readFileSync(filePath, 'utf-8');
@@ -170,8 +237,9 @@ export async function executeTool(plan, cwd) {
         };
       }
 
-      const updated = origNorm.replace(oldNorm, newNorm);
-      fs.writeFileSync(filePath, updated, 'utf-8');
+      const edited = origNorm.replace(oldNorm, () => newNorm);
+      const updated = original.includes('\r\n') ? edited.replace(/\n/g, '\r\n') : edited;
+      atomicWrite(filePath, updated);
 
       const oldHead = (args.old_string || '').split('\n')[0].slice(0, 100);
       const newHead = (args.new_string || '').split('\n')[0].slice(0, 100);
@@ -182,14 +250,14 @@ export async function executeTool(plan, cwd) {
 
     // ── read_file (with optional line range) ───────────────────
     if (tool === 'read_file') {
-      const filePath = path.resolve(cwd, args.path);
+      const filePath = resolveWorkspacePath(cwd, args.path, { write: tool !== 'read_file' });
       if (!fs.existsSync(filePath)) return { ok: false, result: `File not found: ${args.path}` };
 
       const stat = fs.statSync(filePath);
       if (stat.size > 500_000) {
         return {
           ok: false,
-          result: `File too large (${Math.round(stat.size / 1024)}KB). Use start_line/end_line.`,
+          result: `File too large (${Math.round(stat.size / 1024)}KB). Maximum readable file size is 500 KB.`,
         };
       }
 
@@ -204,7 +272,7 @@ export async function executeTool(plan, cwd) {
 
     // ── list_files ─────────────────────────────────────────────
     if (tool === 'list_files') {
-      const dir = path.resolve(cwd, args.directory || '.');
+      const dir = resolveWorkspacePath(cwd, args.directory || '.');
       if (!fs.existsSync(dir)) return { ok: false, result: `Directory not found: ${args.directory}` };
 
       const entries = fs.readdirSync(dir, { withFileTypes: true })
@@ -225,7 +293,7 @@ export async function executeTool(plan, cwd) {
     }
 
     // ── run_command ────────────────────────────────────────────
-    if (tool === 'run_command') return await runCommand(args.command, cwd);
+    if (tool === 'run_command') return await runCommand(args.command, cwd, options);
 
     return { ok: false, result: `Unknown tool: ${tool}` };
   } catch (e) {

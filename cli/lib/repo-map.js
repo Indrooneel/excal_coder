@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import fg from 'fast-glob';
+import { resolveWorkspacePath } from './contracts.js';
 
 const CODE_EXTS = new Set([
   '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
@@ -73,6 +74,7 @@ export async function buildRepoMap(cwd, maxFiles = 60) {
     onlyFiles: true,
     dot: false,
     deep: 8,
+    followSymbolicLinks: false,
   });
 
   const codeFiles = files.filter((f) =>
@@ -94,7 +96,9 @@ export async function buildRepoMap(cwd, maxFiles = 60) {
 
   for (const file of selected) {
     try {
-      const content = fs.readFileSync(path.join(cwd, file), 'utf-8');
+      const safePath = resolveWorkspacePath(cwd, file);
+      if (fs.statSync(safePath).size > 500_000) continue;
+      const content = fs.readFileSync(safePath, 'utf-8');
       const { symbols, imports } = extractFileInfo(content);
 
       out.push(file);

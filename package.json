@@ -11,7 +11,8 @@
     "cli": "node cli/index.js",
     "web": "node server.js",
     "dev:web": "node --watch server.js",
-    "dev:cli": "node --watch cli/index.js"
+    "dev:cli": "node --watch cli/index.js",
+    "test": "node --test tests/*.test.js"
   },
   "keywords": [
     "ai",
