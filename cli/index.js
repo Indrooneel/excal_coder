@@ -1,50 +1,12 @@
 #!/usr/bin/env node
-import './lib/env.js'; 
+import './lib/env.js';
 import readline from 'readline/promises';
 import { stdin, stdout } from 'process';
 import { suggestConstraints } from './lib/mig.js';
 import { runAgentLoop, SYSTEM_PROMPT } from './lib/agent.js';
 import { executeTool } from './lib/tools.js';
 
-// ─── Color palette ──────────────────────────────────────────
-const C = {
-  reset: '\x1b[0m',
-  dim:   '\x1b[2m',
-  bold:  '\x1b[1m',
-  italic:'\x1b[3m',
-  red:   '\x1b[31m',
-  green: '\x1b[32m',
-  yellow:'\x1b[33m',
-  blue:  '\x1b[34m',
-  magenta:'\x1b[35m',
-  cyan:  '\x1b[36m',
-  gray:  '\x1b[90m',
-  bgRed: '\x1b[41m',
-};
-
-// ─── Helpers ────────────────────────────────────────────────
-const W = Math.min(process.stdout.columns || 80, 90);
-const HR = '─'.repeat(W);
-
-function line() { console.log(`${C.gray}${HR}${C.reset}`); }
-function blank() { console.log(); }
-
-function box(title, body, color = C.cyan) {
-  const inner = W - 4;
-  const top = `${color}╭─ ${C.bold}${title}${C.reset}${color} ${'─'.repeat(Math.max(0, inner - title.length - 3))}╮${C.reset}`;
-  const bottom = `${color}╰${'─'.repeat(W - 2)}╯${C.reset}`;
-  console.log(top);
-  for (const l of body.split('\n')) {
-    console.log(`${color}│${C.reset} ${l}`);
-  }
-  console.log(bottom);
-}
-
-function truncate(s, n = 3) {
-  const lines = String(s || '').split('\n');
-  if (lines.length <= n) return lines.join('\n');
-  return lines.slice(0, n).join('\n') + `\n${C.dim}... (${lines.length - n} more lines)${C.reset}`;
-}
+import { createTerminalUI, clean } from './lib/ui.js';
 
 // ─── Session state ──────────────────────────────────────────
 const rl = readline.createInterface({ input: stdin, output: stdout });
@@ -85,134 +47,54 @@ const session = {
   blockedCount: 0,
 };
 
-// ─── UI object passed to agent loop ────────────────────────
-const ui = {
-  notice: (text) => console.log(`\n${C.yellow}${text}${C.reset}`),
-
-  thinking: () => {
-    process.stdout.write(`${C.dim}${C.italic}🧠 thinking…${C.reset}\r`);
-  },
-
-  ai: (text) => {
-    process.stdout.write(' '.repeat(50) + '\r'); // clear thinking line
-    blank();
-    console.log(`${C.cyan}${C.bold}🤖 Excal${C.reset}`);
-    console.log(`${C.cyan}${text}${C.reset}`);
-    blank();
-  },
-
-  toolCall: (tool, args) => {
-    process.stdout.write(' '.repeat(50) + '\r');
-    const argsPreview = JSON.stringify(args).slice(0, 70);
-    console.log(`${C.blue}  ⚙  ${C.bold}${tool}${C.reset} ${C.gray}${argsPreview}${argsPreview.length >= 70 ? '…' : ''}${C.reset}`);
-    session.toolCallCount++;
-  },
-
-  toolResult: (res) => {
-    const icon = res.ok ? `${C.green}✓${C.reset}` : `${C.red}✗${C.reset}`;
-    const body = truncate(res.result, res.ok ? 3 : 5);
-    console.log(`${icon}  ${C.gray}${body.replace(/\n/g, `\n   `)}${C.reset}`);
-  },
-
-  verdict: (v, plan) => {
-    if (v.decision === 'ALLOW') return;
-    blank();
-    const isAllow = v.decision === 'ALLOW';
-    const isDeny  = v.decision === 'DENY';
-    const color   = isDeny ? C.red : isAllow ? C.green : C.yellow;
-    const icon    = isDeny ? '🛑' : isAllow ? '🛡️ ' : '⚠️ ';
-    const label   = isDeny ? 'DENY' : isAllow ? 'ALLOW' : 'GATE';
-
-    box(
-      `${icon} MIG ${label}`,
-      `${C.bold}risk${C.reset}  ${C.bold}${v.risk}${C.reset}/100    ${C.bold}reason${C.reset}  ${v.reason}`,
-      color
-    );
-
-    if (isDeny) session.blockedCount++;
-  },
-
-  blocked: (reason) => {
-    console.log(`${C.red}${C.bold}  → action blocked:${C.reset} ${C.red}${reason}${C.reset}`);
-    blank();
-  },
-
-  approve: async (plan, verdict, { signal, before } = {}) => {
-    // Show a clean gate box for the plan
-    let body = '';
-    if (plan.tool === 'run_command') {
-      body = `${C.bold}$ ${plan.args.command}${C.reset}`;
-    } else if (plan.tool === 'write_file') {
-      body = `${C.bold}${plan.args.path}${C.reset}\n`;
-      if (before !== null && before !== undefined) body += `${C.red}--- current content\n${before}${C.reset}\n`;
-      body += `${C.green}+++ proposed content\n${plan.args.content}${C.reset}`;
-    } else if (plan.tool === 'edit_file') {
-      const oldLines = (plan.args.old_string || '').split('\n');
-      const newLines = (plan.args.new_string || '').split('\n');
-      body = `${C.bold}${plan.args.path}${C.reset}\n`;
-      body += oldLines.map(l => `${C.red}- ${l}${C.reset}`).join('\n');
-      body += '\n';
-      body += newLines.map(l => `${C.green}+ ${l}${C.reset}`).join('\n');
-    } else {
-      body = JSON.stringify(plan.args, null, 2);
-    }
-
-    box(`⚠  APPROVAL REQUIRED — ${plan.tool}`, body, C.yellow);
-    blank();
-
-    if (plan.tool === 'run_command') console.log(`${C.dim}  Shell access uses your account permissions; it is not sandboxed.${C.reset}`);
-    const ans = await ask(`${C.bold}  approve? ${C.gray}[y/N]${C.reset} `, { signal });
-    return ans !== null && /^y(es)?$/i.test(ans.trim());
-  },
-};
-
-// ─── Welcome banner ─────────────────────────────────────────
-console.clear();
-blank();
-console.log(`${C.cyan}${C.bold}  ⚡ EXCAL CODER${C.reset}  ${C.gray}v0.4${C.reset}`);
-console.log(`${C.gray}  governed AI coding agent  ·  house of galatine${C.reset}`);
-blank();
-line();
-console.log(`  ${C.bold}cwd${C.reset}     ${C.gray}${cwd}${C.reset}`);
-console.log(`  ${C.bold}model${C.reset}   ${C.gray}${process.env.EXCAL_MODEL || 'openai/gpt-oss-120b'}${C.reset}`);
-console.log(`  ${C.bold}mig${C.reset}     ${C.green}active${C.reset} ${C.gray}(local deterministic stub)${C.reset}`);
-line();
-console.log(`  ${C.gray}type ${C.bold}exit${C.reset}${C.gray} to quit  ·  ${C.bold}ctrl+c${C.reset}${C.gray} to cancel a task  ·  /help for commands${C.reset}`);
-blank();
+const ui = createTerminalUI({ output: stdout, session, cwd, ask,
+  model: process.env.EXCAL_MODEL || 'openai/gpt-oss-120b (fallbacks enabled)',
+  maxSteps: process.env.EXCAL_MAX_STEPS || 30 });
+ui.banner();
 
 // ─── Main loop ──────────────────────────────────────────────
 while (true) {
-  // Constraint chip on the prompt line
-  const chip = session.constraints
-    ? `${C.yellow}[🔒 ${session.constraints.slice(0, 40)}${session.constraints.length > 40 ? '…' : ''}]${C.reset} `
-    : '';
-  if (chip) console.log(`${C.gray}  constraint active: ${chip}${C.reset}`);
-
-  const prompt = await ask(`${C.bold}${C.green}  ▸ ${C.reset}`);
+  if (session.constraints) ui.notice(`Guardrails: ${session.constraints}`);
+  const prompt = await ask(ui.prompt());
   if (prompt === null) break;
   if (!prompt.trim()) continue;
   if (/^(exit|quit|:q)$/i.test(prompt.trim())) break;
-  if (prompt.trim() === 'clear') { console.clear(); continue; }
+  if (prompt.trim() === 'clear') { if (stdout.isTTY) console.clear(); ui.banner(); continue; }
 
   const input = prompt.trim();
-  if (input === '/help') {
-    console.log('\n/help — commands\n/constraints [text] — view or replace constraints; use - to clear\n/diff — inspect workspace changes\n/clear — reset conversation (keeps constraints)\n/continue — resume the current task\nexit — quit\nCtrl+C — cancel an active task\n');
+  if (input === '/help') { ui.help(); continue; }
+  if (input === '/report') {
+    if (session.progress) ui.report(session.progress);
+    else ui.notice('No task evidence yet.');
+    continue;
+  }
+  if (input === '/status') { ui.status(); continue; }
+  if (input === '/verbose') {
+    session.verbose = !session.verbose;
+    ui.notice(`Tool output: ${session.verbose ? 'full' : 'preview (8 lines)'}`);
+    continue;
+  }
+  if (input === '/last') { ui.panel('LAST TOOL RESULT', session.lastResult || 'No tool output yet.'); continue; }
+  if (input === '/map' || input.startsWith('/map ')) {
+    const result = await executeTool({ tool: 'get_repo_map', args: { directory: input.slice(4).trim() || '.' } }, cwd, { constraints: session.constraints });
+    ui.panel('WORKSPACE MAP', result.result);
     continue;
   }
   if (input === '/constraints' || input.startsWith('/constraints ')) {
     const value = input.slice('/constraints'.length).trim();
     if (value) session.constraints = value === '-' ? '' : value;
-    console.log(`Constraints: ${session.constraints || '(none)'}`);
+    ui.notice(`Constraints: ${session.constraints || '(none)'}`);
     continue;
   }
   if (input === '/diff') {
     const result = await executeTool({ tool: 'git_diff', args: {} }, cwd);
-    console.log(result.result);
+    ui.panel('WORKSPACE DIFF', result.result);
     continue;
   }
   if (input === '/clear') {
     session.messages = [{ role: 'system', content: SYSTEM_PROMPT }];
     session.objective = '';
+    session.progress = null;
     session.rejectedActions = new Set();
     console.log('Conversation cleared.');
     continue;
@@ -232,48 +114,36 @@ while (true) {
   let constraints = session.constraints;
 
   if (suggestions.length) {
-    blank();
-    console.log(`${C.gray}  suggested guardrails:${C.reset}`);
-    suggestions.forEach((s, i) => {
-      console.log(`${C.gray}    ${C.dim}${i + 1}.${C.reset}${C.gray} ${s}${C.reset}`);
-    });
-    const ans = await ask(`${C.gray}  add constraints? (blank = keep current, "-" = clear) > ${C.reset}`);
+    ui.panel('OPTIONAL GUARDRAILS', suggestions.map(s => `• ${s}`).join('\n') + '\n\nEnter custom constraints, leave blank to keep current, or - to clear.');
+    const ans = await ask('  Guardrails ▸ ');
     if (ans === null) break;
     if (ans.trim() === '-') constraints = '';
     else if (ans.trim()) constraints = ans.trim();
   }
 
   session.constraints = constraints;
-  blank();
+
 
   if (input !== '/continue') {
     session.objective = prompt;
+    session.progress = null;
     session.rejectedActions = new Set();
   }
   session.messages.push({ role: 'user', content: input === '/continue' ? 'Continue the active task from its current state. Recheck files if needed.' : prompt });
 
   try {
     activeController = new AbortController();
-    await runAgentLoop(session, ui, cwd, { signal: activeController.signal });
+    ui.taskStart(session.objective);
+    const result = await runAgentLoop(session, ui, cwd, { signal: activeController.signal });
+    ui.taskEnd(result);
   } catch (err) {
-    blank();
-    box('❌ error', err.message.slice(0, 300), C.red);
-    blank();
+
+    ui.panel('ERROR', clean(err.message).slice(0, 500), 31);
+
   } finally {
     activeController = null;
   }
 }
 
-// ─── Session summary ────────────────────────────────────────
-blank();
-line();
-console.log(`${C.cyan}${C.bold}  session summary${C.reset}`);
-console.log(`  ${C.gray}turns${C.reset}      ${session.turnCount}`);
-console.log(`  ${C.gray}tool calls${C.reset} ${session.toolCallCount}`);
-console.log(`  ${C.gray}blocked${C.reset}    ${session.blockedCount}`);
-line();
-blank();
-console.log(`${C.gray}  good session. stay governed. 🛡️${C.reset}`);
-blank();
-
+ui.goodbye();
 rl.close();

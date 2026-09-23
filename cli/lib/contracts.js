@@ -8,10 +8,28 @@ const schemas = {
   list_files: { strings: ['directory'] },
   search_code: { required: ['pattern'], strings: ['pattern', 'glob', 'directory'] },
   find_files: { required: ['pattern'], strings: ['pattern', 'directory'] },
-  get_project_info: {}, get_repo_map: {}, git_diff: {},
+  get_project_info: {}, get_repo_map: { strings: ['directory'], integers: ['depth'] }, git_diff: {},
   run_command: { required: ['command'], strings: ['command'] },
 };
 export const KNOWN_TOOLS = Object.freeze(Object.keys(schemas));
+
+
+export const TOOL_DEFINITIONS = Object.entries(schemas).map(([name, schema]) => ({
+  type: 'function',
+  function: {
+    name,
+    description: `Use ${name} as described in the system instructions.`,
+    parameters: {
+      type: 'object',
+      properties: Object.fromEntries([
+        ...(schema.strings || []).map(key => [key, { type: 'string' }]),
+        ...(schema.integers || []).map(key => [key, { type: 'integer', minimum: 1 }]),
+      ]),
+      required: schema.required || [],
+      additionalProperties: false,
+    },
+  },
+}));
 
 export function validatePlan(plan) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) throw new Error('Tool plan must be an object');
@@ -32,6 +50,7 @@ export function validatePlan(plan) {
   for (const key of ['path', 'directory', 'pattern', 'command', 'old_string']) {
     if (Object.hasOwn(args, key) && (!args[key].trim() || args[key].includes('\0'))) throw new Error(`${key} must be nonempty and contain no NUL bytes`);
   }
+  if (args.depth && args.depth > 8) throw new Error('depth must be between 1 and 8');
   if (args.start_line && args.end_line && args.start_line > args.end_line) throw new Error('start_line must not exceed end_line');
   if (['content', 'new_string'].some(key => args[key]?.length > 1_000_000)) throw new Error('File change exceeds 1 MB limit');
   return plan;

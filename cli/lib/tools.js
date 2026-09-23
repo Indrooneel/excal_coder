@@ -6,6 +6,7 @@ import { promisify } from 'util';
 import fg from 'fast-glob';
 import { buildRepoMap } from './repo-map.js';
 import { validatePlan, resolveWorkspacePath } from './contracts.js';
+import { validate } from './mig.js';
 import { randomUUID } from 'node:crypto';
 
 const execFileP = promisify(execFile);
@@ -288,7 +289,8 @@ export async function executeTool(plan, cwd, options = {}) {
     if (tool === 'get_project_info') return getProjectInfo(cwd);
     if (tool === 'git_diff') return await gitDiff(cwd);
     if (tool === 'get_repo_map') {
-      const map = await buildRepoMap(cwd);
+      const map = await buildRepoMap(cwd, { ...args, allowPath: async target =>
+        (await validate('read_file', { path: target }, options.constraints || '')).decision === 'ALLOW' });
       return { ok: true, result: map };
     }
 

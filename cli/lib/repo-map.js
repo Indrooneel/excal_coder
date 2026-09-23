@@ -1,6 +1,5 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
 import { resolveWorkspacePath } from './contracts.js';
 
 const CODE_EXTS = new Set([
@@ -9,11 +8,9 @@ const CODE_EXTS = new Set([
   '.c', '.cpp', '.h', '.hpp', '.cs', '.swift',
 ]);
 
-const IGNORE = [
-  '**/node_modules/**', '**/.git/**', '**/myenv/**', '**/venv/**',
-  '**/.venv/**', '**/dist/**', '**/build/**', '**/__pycache__/**',
-  '**/.next/**', '**/coverage/**',
-];
+const IGNORED = new Set(['node_modules', '.git', 'myenv', 'venv', '.venv',
+  'dist', 'build', 'target', '__pycache__', '.next', 'coverage', '.cache']);
+const MAX_CHARS = 8000;
 
 const SYMBOL_PATTERNS = [
   /^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)/,
@@ -67,57 +64,70 @@ function extractFileInfo(content) {
   };
 }
 
-export async function buildRepoMap(cwd, maxFiles = 60) {
-  const files = await fg('**/*', {
-    cwd,
-    ignore: IGNORE,
-    onlyFiles: true,
-    dot: false,
-    deep: 8,
-    followSymbolicLinks: false,
-  });
-
-  const codeFiles = files.filter((f) =>
-    CODE_EXTS.has(path.extname(f).toLowerCase())
-  );
-
-  if (codeFiles.length === 0) return '(no code files found)';
-
-  // Shallow paths first — top-level files matter more than deep ones
-  codeFiles.sort((a, b) => {
-    const da = a.split('/').length;
-    const db = b.split('/').length;
-    if (da !== db) return da - db;
-    return a.localeCompare(b);
-  });
-
-  const selected = codeFiles.slice(0, maxFiles);
-  const out = [];
-
-  for (const file of selected) {
+export async function buildRepoMap(cwd, options = {}) {
+  const { directory = '.', depth = 3, allowPath = async () => true } = options;
+  const base = resolveWorkspacePath(cwd, directory);
+  const queue = [{ absolute: base, relative: '', level: 0 }];
+  const entries = [];
+  let truncated = false;
+  // Bound enumeration as well as prompt size. Do not follow symlinks.
+  while (queue.length && entries.length < 120) {
+    const current = queue.shift();
+    let handle;
     try {
-      const safePath = resolveWorkspacePath(cwd, file);
-      if (fs.statSync(safePath).size > 500_000) continue;
-      const content = fs.readFileSync(safePath, 'utf-8');
-      const { symbols, imports } = extractFileInfo(content);
-
-      out.push(file);
-      if (symbols.length) {
-        const shown = symbols.slice(0, 8).join(', ');
-        const more = symbols.length > 8 ? ` +${symbols.length - 8}` : '';
-        out.push(`  ⚙ ${shown}${more}`);
+      handle = await fs.promises.opendir(current.absolute);
+      let examined = 0;
+      for await (const entry of handle) {
+        if (++examined > 500 || entries.length >= 120) { truncated = true; break; }
+        if (IGNORED.has(entry.name) || entry.name.startsWith('.env') || entry.isSymbolicLink()) continue;
+        if (!entry.isDirectory() && !entry.isFile()) continue;
+        const absolute = path.join(current.absolute, entry.name);
+        const relative = path.join(current.relative, entry.name);
+        const workspaceRelative = path.relative(cwd, absolute);
+        try { resolveWorkspacePath(cwd, workspaceRelative); } catch { continue; }
+        if (!(await allowPath(workspaceRelative))) continue;
+        const isDir = entry.isDirectory();
+        const clipped = isDir && current.level + 1 >= depth;
+        entries.push({ absolute, relative, isDir, clipped });
+        if (isDir && !clipped) queue.push({ absolute, relative, level: current.level + 1 });
+        if (clipped) truncated = true;
       }
-      if (imports.length) {
-        const shown = imports.slice(0, 5).join(', ');
-        const more = imports.length > 5 ? ` +${imports.length - 5}` : '';
-        out.push(`  → ${shown}${more}`);
-      }
-      out.push('');
-    } catch {
-      // skip unreadable files
-    }
+    } catch { /* unreadable or concurrently removed directory */ }
   }
-
-  const header = `[Repo Map — ${selected.length}/${codeFiles.length} code files]`;
-  return `${header}\n\n${out.join('\n')}`;
+  if (queue.length) truncated = true;
+  entries.sort((a, b) => {
+    const left = a.relative.split(path.sep), right = b.relative.split(path.sep);
+    for (let i = 0; i < Math.min(left.length, right.length); i++) {
+      const comparison = left[i].localeCompare(right[i]);
+      if (comparison) return comparison;
+    }
+    return left.length - right.length;
+  });
+  const lines = [`[Workspace map: ${directory}]`, 'Directory tree (names only):'];
+  for (const entry of entries) {
+    const parts = entry.relative.split(path.sep);
+    lines.push(`${'  '.repeat(parts.length - 1)}${parts.at(-1)}${entry.isDir ? '/' : ''}${entry.clipped ? ' …' : ''}`);
+  }
+  if (!entries.length) lines.push('(empty or excluded workspace)');
+  lines.push('', 'Code symbols and imports (approximate; read files to confirm):');
+  let bytes = 0, mapped = 0;
+  for (const entry of entries.filter(e => !e.isDir && CODE_EXTS.has(path.extname(e.relative)))) {
+    if (mapped >= 40 || bytes >= 2_000_000) { truncated = true; break; }
+    try {
+      resolveWorkspacePath(cwd, path.relative(cwd, entry.absolute));
+      if (fs.lstatSync(entry.absolute).isSymbolicLink()) continue;
+      const size = fs.statSync(entry.absolute).size;
+      if (size > 500_000 || bytes + size > 2_000_000) { truncated = true; continue; }
+      const { symbols, imports } = extractFileInfo(fs.readFileSync(entry.absolute, 'utf8'));
+      bytes += size;
+      mapped++;
+      lines.push(entry.relative);
+      if (symbols.length) lines.push(`  symbols: ${symbols.slice(0, 8).join(', ')}`);
+      if (imports.length) lines.push(`  imports: ${imports.slice(0, 5).join(', ')}`);
+    } catch { /* unreadable files */ }
+  }
+  if (!mapped) lines.push('(no readable code files in this view)');
+  let result = lines.join('\n');
+  if (result.length > MAX_CHARS - 240) { result = result.slice(0, MAX_CHARS - 240); truncated = true; }
+  return result + `\n\n${truncated ? '[Partial map: depth, entry, byte or output limit reached.] ' : ''}Use get_repo_map(directory, depth) to explore a folder. This snapshot may become stale after edits.`;
 }

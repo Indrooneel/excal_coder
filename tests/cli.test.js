@@ -286,3 +286,134 @@ test('CLI exits cleanly on EOF while waiting for input', { timeout: 5000 }, asyn
   assert.match(output, /session summary/);
   assert.doesNotMatch(error, /unsettled/);
 });
+
+test('provider requests advertise native tool schemas', async () => {
+  let request;
+  const call = createModelCaller({ client: { chat: { completions: { create: async input => {
+    request = input;
+    return completion('Done');
+  } } } }, models: ['test'] });
+  await call([]);
+  assert.equal(request.tool_choice, 'auto');
+  assert.equal(request.parallel_tool_calls, false);
+  assert.equal(request.tools.length, 10);
+  assert.ok(request.tools.some(tool => tool.function.name === 'edit_file'));
+});
+
+test('native tool calls execute through normal approval and validation', async t => {
+  const { cwd } = workspace(t);
+  const h = harness([{ choices: [{ message: { content: null, tool_calls: [{
+    id: 'call_1', type: 'function', function: { name: 'write_file', arguments: JSON.stringify({ path: 'native.txt', content: 'native works' }) },
+  }] } }] }, 'Done']);
+  let approved = false;
+  h.ui.approve = async () => { approved = true; return true; };
+  assert.equal((await runAgentLoop(h.session, h.ui, cwd, h.options)).status, 'completed');
+  assert.equal(approved, true);
+  assert.equal(fs.readFileSync(path.join(cwd, 'native.txt'), 'utf8'), 'native works');
+});
+
+test('native tool batches are rejected without executing any action', async t => {
+  const { cwd } = workspace(t);
+  const call = { type: 'function', function: { name: 'write_file', arguments: '{"path":"x","content":"x"}' } };
+  const response = { choices: [{ message: { tool_calls: [call, call] } }] };
+  const h = harness([response, response, response]);
+  assert.equal((await runAgentLoop(h.session, h.ui, cwd, h.options)).status, 'invalid_response');
+  assert.equal(fs.existsSync(path.join(cwd, 'x')), false);
+});
+
+test('workspace map includes docs/configs, symbols and expandable folders', async t => {
+  const { cwd } = workspace(t);
+  fs.mkdirSync(path.join(cwd, 'src/nested'), { recursive: true });
+  fs.writeFileSync(path.join(cwd, 'README.md'), 'Documentation');
+  fs.writeFileSync(path.join(cwd, 'package.json'), '{}');
+  fs.writeFileSync(path.join(cwd, 'src/nested/app.js'), "import fs from 'node:fs';\nexport function hello() {}\n");
+  const root = await executeTool(plan('get_repo_map', { depth: 1 }), cwd);
+  assert.equal(root.ok, true);
+  assert.match(root.result, /README.md/);
+  assert.match(root.result, /package.json/);
+  assert.match(root.result, /src\/ …/);
+  assert.doesNotMatch(root.result, /hello/);
+  const expanded = await executeTool(plan('get_repo_map', { directory: 'src', depth: 3 }), cwd);
+  assert.match(expanded.result, /hello/);
+  assert.match(expanded.result, /node:fs/);
+  assert.equal((await executeTool(plan('get_repo_map', { directory: '..' }), cwd)).ok, false);
+  assert.equal((await executeTool(plan('get_repo_map', { depth: 9 }), cwd)).ok, false);
+});
+
+test('workspace map excludes generated files, env files and constrained paths', async t => {
+  const { cwd } = workspace(t);
+  for (const directory of ['private', 'node_modules', 'dist']) {
+    fs.mkdirSync(path.join(cwd, directory));
+    fs.writeFileSync(path.join(cwd, directory, 'hidden.js'), 'export function secretMarker() {}');
+  }
+  fs.writeFileSync(path.join(cwd, '.env'), 'TEST_SECRET=not-real');
+  fs.writeFileSync(path.join(cwd, 'visible.js'), 'export function visible() {}');
+  const result = await executeTool(plan('get_repo_map'), cwd, { constraints: 'do not read private' });
+  assert.match(result.result, /visible/);
+  assert.doesNotMatch(result.result, /private|node_modules|dist\/|\.env|secretMarker/);
+});
+
+test('large maps are bounded and explicitly partial', async t => {
+  const { cwd } = workspace(t);
+  for (let i = 0; i < 150; i++) fs.writeFileSync(path.join(cwd, `file-${i}.js`), `export function function${i}() {}`);
+  const result = await executeTool(plan('get_repo_map'), cwd);
+  assert.equal(result.ok, true);
+  assert.ok(result.result.length <= 8000);
+  assert.match(result.result, /Partial map/);
+});
+
+test('automatic map reaches the first model call and refreshes on continuation', async t => {
+  const { cwd } = workspace(t);
+  fs.writeFileSync(path.join(cwd, 'README.md'), 'test');
+  const requests = [];
+  const h = harness([], { callModel: async messages => { requests.push(messages); return completion('Done'); } });
+  await runAgentLoop(h.session, h.ui, cwd, h.options);
+  assert.ok(requests[0].some(m => m.content.includes('Workspace snapshot') && m.content.includes('README.md')));
+  fs.writeFileSync(path.join(cwd, 'new-file.js'), 'export function added() {}');
+  await runAgentLoop(h.session, h.ui, cwd, h.options);
+  assert.ok(requests[1].some(m => m.content.includes('new-file.js')));
+  assert.equal(requests[1].filter(m => m.content.startsWith('Workspace snapshot')).length, 1);
+});
+
+test('verification evidence flags checks made before later edits', async () => {
+  const { createProgress, recordProgress, progressReport, progressChecklist } = await import('../cli/lib/progress.js');
+  const progress = createProgress('Fix a bug');
+  recordProgress(progress, plan('run_command', { command: 'npm test' }), { ok: true, result: 'passed' });
+  recordProgress(progress, plan('edit_file', { path: 'app.js' }), { ok: true, result: 'edited' });
+  assert.match(progressReport(progress), /before the latest file edit; rerun needed/);
+  assert.match(progressChecklist(progress)[3], /^○/);
+  recordProgress(progress, plan('git_diff'), { ok: true, result: 'diff' });
+  assert.match(progressChecklist(progress)[3], /^✓/);
+  recordProgress(progress, plan('run_command', { command: 'node script.js' }), { ok: true, result: 'ok' });
+  assert.match(progressChecklist(progress)[3], /^○/);
+});
+
+test('failed edits are not recorded as changed files', async () => {
+  const { createProgress, recordProgress, progressReport } = await import('../cli/lib/progress.js');
+  const progress = createProgress('Fix a bug');
+  recordProgress(progress, plan('edit_file', { path: 'app.js' }), { ok: false, result: 'match not found' });
+  assert.equal(progress.files.size, 0);
+  assert.equal(progress.failures.length, 1);
+  assert.match(progressReport(progress), /Verification is not recorded/);
+});
+
+test('agent reports real evidence and preserves it across continuation', async t => {
+  const { cwd } = workspace(t);
+  const h = harness([JSON.stringify(plan('write_file', { path: 'x', content: 'x' })), 'Done', 'Continued']);
+  const reports = [];
+  h.ui.report = progress => reports.push({ status: progress.status, files: [...progress.files] });
+  await runAgentLoop(h.session, h.ui, cwd, h.options);
+  await runAgentLoop(h.session, h.ui, cwd, h.options);
+  assert.deepEqual(reports, [{ status: 'completed', files: ['x'] }, { status: 'completed', files: ['x'] }]);
+});
+
+test('denied actions produce a report without recording the proposed file as changed', async t => {
+  const { cwd } = workspace(t);
+  const h = harness([JSON.stringify(plan('write_file', { path: 'denied', content: 'x' }))]);
+  h.ui.approve = async () => false;
+  let report;
+  h.ui.report = value => { report = value; };
+  await runAgentLoop(h.session, h.ui, cwd, h.options);
+  assert.equal(report.status, 'denied');
+  assert.equal(report.files.size, 0);
+});
